@@ -418,13 +418,6 @@ Guidance:
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Image library (built once)
-function buildLibrary(){
-  const names = window.PLACEHOLDERS.filenames;
-  return names.slice(0, 8).map((n, i) => window.PLACEHOLDERS.make(i, n));
-}
-
-// ─────────────────────────────────────────────────────────────────────────
 // Filename composer with tokens
 // pattern: e.g. "{name}_cutout_{NN}.{ext}"
 function composeName(pattern, image, index, ext){
@@ -1724,9 +1717,9 @@ function ExportModal({images, selectedIds, settings, onClose, onConfirm}){
 function App(){
   const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
 
-  const [images, setImages] = useState(()=>buildLibrary());
-  const [activeId, setActiveId] = useState(()=>{ const lib = buildLibrary(); return lib[0]?.id || null; });
-  const [selectedIds, setSelectedIds] = useState(()=>{ const lib = buildLibrary(); return new Set(lib[0] ? [lib[0].id] : []); });
+  const [images, setImages] = useState([]);
+  const [activeId, setActiveId] = useState(null);
+  const [selectedIds, setSelectedIds] = useState(()=>new Set());
   const [view, setView] = useState('single');
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({x:0, y:0});
