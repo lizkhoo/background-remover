@@ -1,0 +1,19 @@
+# Static site — no build step. Babel/React are loaded in-browser via CDN,
+# so we just publish the repo root as-is.
+[build]
+  publish = "."
+  command = ""
+
+# JSX files are served as text/babel and compiled client-side; make sure
+# they're delivered with a sane content type and not aggressively cached,
+# so a redeploy is picked up immediately.
+[[headers]]
+  for = "/*.jsx"
+  [headers.values]
+    Content-Type = "text/babel; charset=utf-8"
+    Cache-Control = "no-cache"
+
+[[headers]]
+  for = "/index.html"
+  [headers.values]
+    Cache-Control = "no-cache"
