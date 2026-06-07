@@ -109,6 +109,44 @@ function makeHistogram(seed){
 }
 
 // ─────────────────────────────────────────────────────────────────────────
+// Rasterize a set of brush strokes into a black/white mask at w×h. White =
+// covered by a stroke. Used by BOTH the protect brush (Restore — keep opaque)
+// and the erase brush (Paintbrush — make transparent), and by both the live
+// preview and the full-res rasterizer. `size` is in image-natural px; pass
+// radiusScale = w / naturalWidth when rendering into a downscaled canvas.
+// Returns the mask's pixel data (read the red channel: > 128 = covered), or
+// null when there are no strokes.
+function strokesToMask(strokes, w, h, radiusScale){
+  if(!strokes || !strokes.length) return null;
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = '#000'; ctx.fillRect(0, 0, w, h);
+  ctx.strokeStyle = '#fff'; ctx.fillStyle = '#fff';
+  ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+  for(const s of strokes){
+    const r = ((s.size || 36) / 2) * radiusScale;
+    const pts = s.points || [];
+    if(!pts.length) continue;
+    // dots at every point (covers single-tap dabs and round caps)
+    for(const p of pts){
+      ctx.beginPath();
+      ctx.arc(p.x * w, p.y * h, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    // polyline segments between points
+    if(pts.length > 1){
+      ctx.lineWidth = r * 2;
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x * w, pts[0].y * h);
+      for(let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x * w, pts[i].y * h);
+      ctx.stroke();
+    }
+  }
+  return ctx.getImageData(0, 0, w, h).data;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 // Real cutout rasterizer — runs the same seed-color logic as the SVG filter,
 // but on a 2D canvas so we can produce a real PNG/WebP/JPG blob for Keep + Export.
 // Returns a Promise<{dataUrl, blob, width, height}>.
@@ -171,74 +209,38 @@ function rasterizeCutout(image, seeds, format='png'){
           }
         }
 
-        // Rasterize protect strokes onto a single-channel mask canvas using the
-        // same polyline-with-round-caps approach the live preview uses, so the
-        // kept cutout matches what the user saw on screen.
-        const allStrokes = (seeds?.protectStrokes || []);
-        let protectMask = null;
-        if(allStrokes.length){
-          const pmc = document.createElement('canvas');
-          pmc.width = W; pmc.height = H;
-          const pctx = pmc.getContext('2d');
-          pctx.fillStyle = '#000';
-          pctx.fillRect(0, 0, W, H);
-          pctx.strokeStyle = '#fff';
-          pctx.fillStyle = '#fff';
-          pctx.lineCap = 'round';
-          pctx.lineJoin = 'round';
-          for(const s of allStrokes){
-            // v14: protect-stroke `size` is stored in image-natural pixels
-            // (it's set straight from `protectBrushSize`, which is already in
-            // image space — see SingleCanvas brush-cursor math at line ~1509).
-            // The previous `size/640 * min(W,H)` formula treated it as if it
-            // were in a 640-unit reference space, producing a wildly oversized
-            // brush at full image resolution (e.g. a 389px brush became
-            // ~1838px on a 4032×3024 photo). That's why the Kept cutout no
-            // longer matched the live preview — protect coverage was huge.
-            const dia = (s.size || 36); // brush diameter in image-natural px
-            pctx.lineWidth = dia;
-            const pts = (s.points||[]).map(p => ({x: p.x*W, y: p.y*H}));
-            if(pts.length > 1){
-              pctx.beginPath();
-              pctx.moveTo(pts[0].x, pts[0].y);
-              for(let k=1;k<pts.length;k++) pctx.lineTo(pts[k].x, pts[k].y);
-              pctx.stroke();
-            }
-            // also stamp circles at every point so single-tap dabs and stroke ends are filled
-            for(const p of pts){
-              pctx.beginPath();
-              pctx.arc(p.x, p.y, dia/2, 0, Math.PI*2);
-              pctx.fill();
-            }
-          }
-          protectMask = pctx.getImageData(0, 0, W, H).data;
-        }
-        const isProtected = (px, py) => {
-          if(!protectMask) return false;
-          // red channel of black/white mask
-          return protectMask[(py*W + px) * 4] > 128;
-        };
-        const strokes = allStrokes; // kept for readability below
+        // Brush masks (full image-natural resolution → radiusScale = 1; stroke
+        // `size` is already in image-natural px). Protect = keep opaque,
+        // Erase = force transparent. Same polyline-with-round-caps approach the
+        // live preview uses, so the Kept cutout matches what the user saw.
+        const protectMask = strokesToMask(seeds?.protectStrokes, W, H, 1);
+        const eraseMask   = strokesToMask(seeds?.eraseStrokes,   W, H, 1);
+        const isProtected = (px, py) => protectMask ? protectMask[(py*W + px) * 4] > 128 : false;
+        const isErased    = (px, py) => eraseMask   ? eraseMask[(py*W + px) * 4]   > 128 : false;
 
         const tolerance = (seeds?.tolerance ?? 32);
         const t = Math.max(2, tolerance) / 100;
         const radius = t * 0.55 * 255 * Math.sqrt(3); // distance threshold in 0..255 RGB space
         const softness = radius * 0.35;
 
-        if(seedColors.length === 0){
-          // No box / no seed colors — keep the image as-is. Protect strokes alone
-          // shouldn't erase the whole image (that's how v7 behaved); they only
-          // override the seed-color cutout once one is in play.
+        if(seedColors.length === 0 && !eraseMask){
+          // No box / no seed colors / no erase strokes — keep the image as-is.
+          // Protect strokes alone shouldn't erase the whole image (that's how v7
+          // behaved); they only override the seed-color cutout once one is in play.
         } else {
-          // For each pixel, compute min distance to any seed color in RGB space.
+          // For each pixel: protect wins (stay opaque), then erase (force
+          // transparent), else seed-color min-distance alpha (if any seeds).
           // alpha = smoothstep(radius - softness, radius + softness, dist)
           const lo = radius - softness;
           const hi = radius + softness;
           const range = Math.max(1, hi - lo);
+          const hasColor = seedColors.length > 0;
           for(let y=0;y<H;y++){
             for(let x=0;x<W;x++){
               const i = (y*W + x) * 4;
-              if(isProtected(x, y)){ continue; } // keep fully opaque
+              if(isProtected(x, y)){ continue; }       // keep fully opaque
+              if(isErased(x, y)){ data[i+3] = 0; continue; } // paint → transparent
+              if(!hasColor){ continue; }                // erase-only image: leave rest opaque
               const r = data[i], g = data[i+1], bl = data[i+2];
               let best = Infinity;
               for(const c of seedColors){
@@ -612,14 +614,15 @@ function SeedChip({color, onRemove}){
 // Minimal guided detection — v6: dropped Tap & Scribble. Box detection is
 // reliable enough that the only inputs the user needs are (a) drag a box
 // around the subject and (b) paint over interior pixels they want to keep.
-function GuidedPanel({mode, setMode, seeds, setSeeds, onClearSeeds, hasImage}){
+function GuidedPanel({mode, setMode, seeds, setSeeds, commitSeeds, onClearSeeds, hasImage}){
   const boxesArr = (seeds.boxes && seeds.boxes.length) ? seeds.boxes : (seeds.box ? [seeds.box] : []);
   const counts = {
     boxes: boxesArr.length,
     protectStrokes: (seeds.protectStrokes || []).length,
     bgSamples: (seeds.bgSamples || []).length,
+    eraseStrokes: (seeds.eraseStrokes || []).length,
   };
-  const totalSeeds = counts.boxes + counts.protectStrokes + counts.bgSamples;
+  const totalSeeds = counts.boxes + counts.protectStrokes + counts.bgSamples + counts.eraseStrokes;
 
   const Tab = ({id, icon, label}) => (
     <button onClick={()=>setMode(id)}
@@ -647,6 +650,42 @@ function GuidedPanel({mode, setMode, seeds, setSeeds, onClearSeeds, hasImage}){
         <Tab id="protect" icon={<Icon.Shield size={12}/>} label="Restore"/>
       </div>
 
+      {/* Sample sub-tool — two input form factors for marking what to remove.
+          Click samples a color (removed everywhere); Paintbrush erases the
+          exact region you paint, regardless of color. Same segmented control
+          (.seg tablist) used by the Single | Contact sheet toggle. */}
+      {mode === 'sample' && (() => {
+        const tool = seeds.sampleTool ?? 'click';
+        return (
+          <div style={{display:'flex',flexDirection:'column',gap:8}}>
+            <div className="seg" role="tablist" aria-label="Sample tool" style={{width:'100%',height:30}}>
+              <button role="tab" aria-selected={tool==='click'} className={tool==='click'?'on':''}
+                style={{flex:1,justifyContent:'center'}}
+                onClick={()=>setSeeds(s=>({...s, sampleTool:'click'}))}>
+                <Icon.Cursor size={13}/> Click
+              </button>
+              <button role="tab" aria-selected={tool==='paint'} className={tool==='paint'?'on':''}
+                style={{flex:1,justifyContent:'center'}}
+                onClick={()=>setSeeds(s=>({...s, sampleTool:'paint'}))}>
+                <Icon.Brush size={13}/> Paintbrush
+              </button>
+            </div>
+            {tool === 'paint' && (
+              <div className="field" style={{marginBottom:0}}>
+                <div className="field-h">
+                  <span>Brush size</span>
+                  <span className="mono field-v">{Math.round(seeds.eraseBrushSize ?? 60)}px</span>
+                </div>
+                <LinearSlider
+                  value={seeds.eraseBrushSize ?? 60}
+                  min={8} max={400} step={1}
+                  onChange={v=>setSeeds(s=>({...s, eraseBrushSize: Math.max(8, Math.min(400, Math.round(v)))}))}/>
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
       {/* Status surface — shows the box, refine pins, and any protect strokes */}
       <div style={{display:'flex',flexDirection:'column',gap:6}}>
         <div style={{display:'flex',justifyContent:'space-between',alignItems:'baseline'}}>
@@ -661,7 +700,7 @@ function GuidedPanel({mode, setMode, seeds, setSeeds, onClearSeeds, hasImage}){
           )}
         </div>
 
-        {counts.boxes === 0 && counts.protectStrokes === 0 && counts.bgSamples === 0 ? (
+        {counts.boxes === 0 && counts.protectStrokes === 0 && counts.bgSamples === 0 && counts.eraseStrokes === 0 ? (
 
           <div style={{
             padding:'12px 10px',border:'1px dashed var(--line-2)',borderRadius:6,
@@ -671,7 +710,9 @@ function GuidedPanel({mode, setMode, seeds, setSeeds, onClearSeeds, hasImage}){
               ? (mode === 'protect'
                   ? 'Paint over interior subject pixels you want to keep, no matter what.'
                   : mode === 'sample'
-                  ? 'Click anywhere on a background color (purple, wood, etc.) to remove it. Click multiple background tones to handle mixed backgrounds.'
+                  ? ((seeds.sampleTool ?? 'click') === 'paint'
+                      ? 'Paint over the areas you want to make transparent — the brushed pixels are erased directly, whatever their color.'
+                      : 'Click anywhere on a background color (purple, wood, etc.) to remove it. Click multiple background tones to handle mixed backgrounds.')
                   : 'Drag a box around the subject.')
               : 'Load an image to begin.'}
           </div>
@@ -705,12 +746,21 @@ function GuidedPanel({mode, setMode, seeds, setSeeds, onClearSeeds, hasImage}){
                   {counts.bgSamples} sampled
                 </span>
               )}
+              {counts.eraseStrokes > 0 && (
+                <span className="mono" style={{
+                  display:'inline-flex',alignItems:'center',gap:6,padding:'4px 8px',
+                  background:'#fff',border:'1px solid oklch(0.55 0.18 28)',borderRadius:6,fontSize:11,color:'var(--fg-1)',
+                }}>
+                  <Icon.Brush size={10}/>
+                  {counts.eraseStrokes} erased
+                </span>
+              )}
             </div>
             {counts.bgSamples > 0 && (
               <div style={{display:'flex',flexWrap:'wrap',gap:4}}>
                 {(seeds.bgSamples || []).map((c, i) => (
                   <SeedChip key={i} color={c}
-                    onRemove={() => setSeeds(s => ({
+                    onRemove={() => (commitSeeds || setSeeds)(s => ({
                       ...s,
                       bgSamples: (s.bgSamples || []).filter((_, j) => j !== i),
                     }))}/>
@@ -739,17 +789,34 @@ function GuidedPanel({mode, setMode, seeds, setSeeds, onClearSeeds, hasImage}){
         {mode === 'box' && (counts.boxes > 0
           ? <>Drag another rectangle to add more background seeds.</>
           : <>Drag a rectangle around the subject.</>)}
+        {mode === 'sample' && (seeds.sampleTool ?? 'click') === 'paint' && <>Paint over what should become transparent. <kbd>[</kbd> <kbd>]</kbd> or scroll to resize the brush.</>}
         {mode === 'protect' && <>Paint subject pixels that must stay opaque. <kbd>[</kbd> <kbd>]</kbd> to resize. The cutout will never erase these.</>}
       </div>
     </div>
   );
 }
 
-// Discard / Keep action bar — pinned to the bottom of the Cutout panel once
-// the user has produced a cutout preview. Discard reverts the active image
-// to its original state; Keep commits the cutout so the filmstrip thumbnail
-// reflects the change. Distinct from Export, which writes files to disk.
-function CutoutActions({canCommit, isKept, onDiscard, onKeep}){
+// Undo / Redo / Undo All action bar — pinned to the bottom of the Cutout
+// panel. The cutout is auto-kept after every edit, so there's no manual Keep:
+// Undo steps back through the last action, Redo re-applies it, and Undo All
+// restores the image to its original, untouched state. Distinct from Export,
+// which writes files to disk.
+function CutoutActions({canUndo, canRedo, hasAny, onUndo, onRedo, onUndoAll}){
+  const Btn = ({onClick, disabled, icon, label, title, danger}) => (
+    <button
+      onClick={onClick}
+      disabled={disabled}
+      className="tb-btn ghost"
+      style={{
+        flex:1,height:32,justifyContent:'center',
+        color: danger ? 'var(--danger)' : 'var(--fg-1)',
+        opacity: disabled ? 0.4 : 1,
+        pointerEvents: disabled ? 'none' : 'auto',
+      }}
+      title={title}>
+      {icon} {label}
+    </button>
+  );
   return (
     <div style={{
       borderTop:'1px solid var(--line)',
@@ -757,45 +824,26 @@ function CutoutActions({canCommit, isKept, onDiscard, onKeep}){
       background:'#fff',
       display:'flex',gap:8,
     }}>
-      <button
-        onClick={onDiscard}
-        disabled={!canCommit && !isKept}
-        className="tb-btn ghost"
-        style={{
-          flex:1,height:32,justifyContent:'center',
-          color:'var(--fg-1)',
-          opacity:(!canCommit && !isKept) ? 0.4 : 1,
-          pointerEvents:(!canCommit && !isKept) ? 'none' : 'auto',
-        }}
-        title="Reset image to original">
-        <Icon.Reset size={12}/> Discard
-      </button>
-      <button
-        onClick={onKeep}
-        disabled={!canCommit || isKept}
-        className="tb-btn primary"
-        style={{
-          flex:1,height:32,justifyContent:'center',fontWeight:600,
-          opacity:(!canCommit || isKept) ? 0.5 : 1,
-          pointerEvents:(!canCommit || isKept) ? 'none' : 'auto',
-        }}
-        title="Save cutout to filmstrip (does not export)">
-        <Icon.Check size={12}/> {isKept ? 'Kept' : 'Keep'}
-      </button>
+      <Btn onClick={onUndo} disabled={!canUndo} icon={<Icon.Undo size={12}/>}
+           label="Undo" title="Undo last action (⌘Z)"/>
+      <Btn onClick={onRedo} disabled={!canRedo} icon={<Icon.Redo size={12}/>}
+           label="Redo" title="Redo last action (⇧⌘Z)"/>
+      <Btn onClick={onUndoAll} disabled={!hasAny && !canUndo} icon={<Icon.Reset size={12}/>}
+           label="Undo All" title="Restore the original image" danger/>
     </div>
   );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
 // Left controls panel — v4 stripped to the essentials
-function ControlsPanel({activeImage, guidedMode, setGuidedMode, seeds, setSeeds, onClearSeeds, onDiscard, onKeep}){
+function ControlsPanel({activeImage, guidedMode, setGuidedMode, seeds, setSeeds, commitSeeds, onClearSeeds, canUndo, canRedo, onUndo, onRedo, onUndoAll}){
   const hasSeeds = !!(
     (seeds.boxes && seeds.boxes.length) ||
     seeds.box ||
     (seeds.protectStrokes && seeds.protectStrokes.length) ||
-    (seeds.bgSamples && seeds.bgSamples.length)
+    (seeds.bgSamples && seeds.bgSamples.length) ||
+    (seeds.eraseStrokes && seeds.eraseStrokes.length)
   );
-  const isKept = !!activeImage?.processed;
   return (
     <div className="panel-l">
       <div className="panel-l-head">
@@ -805,7 +853,7 @@ function ControlsPanel({activeImage, guidedMode, setGuidedMode, seeds, setSeeds,
       <div className="panel-l-body nice-scroll" style={{padding:'14px 14px 14px'}}>
         <GuidedPanel
           mode={guidedMode} setMode={setGuidedMode}
-          seeds={seeds} setSeeds={setSeeds}
+          seeds={seeds} setSeeds={setSeeds} commitSeeds={commitSeeds}
           onClearSeeds={onClearSeeds}
           hasImage={!!activeImage}
         />
@@ -813,10 +861,12 @@ function ControlsPanel({activeImage, guidedMode, setGuidedMode, seeds, setSeeds,
 
       {!!activeImage && (
         <CutoutActions
-          canCommit={hasSeeds}
-          isKept={isKept}
-          onDiscard={onDiscard}
-          onKeep={onKeep}
+          canUndo={canUndo}
+          canRedo={canRedo}
+          hasAny={hasSeeds}
+          onUndo={onUndo}
+          onRedo={onRedo}
+          onUndoAll={onUndoAll}
         />
       )}
     </div>
@@ -935,7 +985,7 @@ function Filmstrip({images, activeId, selectedIds, onSelect, onActivate, thumbSi
 
 // ─────────────────────────────────────────────────────────────────────────
 // Single canvas with zoom/pan + click toggle
-function SingleCanvas({image, s, zoom, setZoom, pan, setPan, onClickToggle, peekOriginal, brush, setBrush, guidedMode='off', seeds, setSeeds, fitKey, onFit, showOrigClick}){
+function SingleCanvas({image, s, zoom, setZoom, pan, setPan, onClickToggle, peekOriginal, brush, setBrush, guidedMode='off', seeds, setSeeds, pushHistory, fitKey, onFit, showOrigClick}){
   const ref = useRef(null);
   const stageRef = useRef(null);
   // Natural image dimensions — used to compute the Fit-to-pane base size so
@@ -986,6 +1036,7 @@ function SingleCanvas({image, s, zoom, setZoom, pan, setPan, onClickToggle, peek
   const guiding = guidedMode === 'box' || guidedMode === 'protect' || guidedMode === 'sample';
   const protecting = guidedMode === 'protect';
   const sampling = guidedMode === 'sample';
+  const samplePainting = sampling && (seeds?.sampleTool === 'paint');
   const brushing = !guiding && (brush?.mode === 'keep' || brush?.mode === 'remove');
 
   // Wheel zoom + pan
@@ -996,6 +1047,9 @@ function SingleCanvas({image, s, zoom, setZoom, pan, setPan, onClickToggle, peek
       setZoom(z => Math.max(0.1, Math.min(8, z * (1 + d))));
     } else if (brushing) {
       setBrush?.(b => ({...b, size: Math.max(10, Math.min(100, Math.round(b.size - e.deltaY * 0.05)))}));
+    } else if (samplePainting) {
+      // wheel resizes the sample paintbrush ([ / ] also work)
+      setSeeds?.(s => ({...s, eraseBrushSize: Math.max(8, Math.min(400, Math.round((s.eraseBrushSize ?? 60) - e.deltaY * 0.25)))}));
     } else if (protecting) {
       // [/] keys also work; wheel resizes the protect brush
       setSeeds?.(s => ({...s, protectBrushSize: Math.max(8, Math.min(500, Math.round((s.protectBrushSize ?? 100) - e.deltaY * 0.25)))}));
@@ -1030,6 +1084,23 @@ function SingleCanvas({image, s, zoom, setZoom, pan, setPan, onClickToggle, peek
     } catch(e){ return null; }
   };
 
+  // Snapshot of committed seeds captured at the start of a drag gesture, so the
+  // whole stroke/box collapses into a single undo step on release.
+  const gestureSnapshotRef = useRef(null);
+
+  // Click-sample the single pixel under the cursor and add it to bgSamples
+  // (exact-match dedup — a deliberately-picked tone is always honored). The
+  // paintbrush is NOT a color sampler; it paints spatial erase strokes below.
+  const addSampleAt = (u, v) => {
+    const c = samplePixel(u, v);
+    if(!c) return;
+    setSeeds(st => {
+      const existing = st.bgSamples || [];
+      if(existing.some(e => e.r === c.r && e.g === c.g && e.b === c.b)) return st;
+      return {...st, bgSamples: [...existing, c]};
+    });
+  };
+
   // Drag pan + guided drawing
   const dragRef = useRef(null);
   const onMouseDown = (e) => {
@@ -1043,26 +1114,25 @@ function SingleCanvas({image, s, zoom, setZoom, pan, setPan, onClickToggle, peek
     }
     if(guiding){
       const p = stageCoords(e); if(!p) return;
-      // sample: pick the color under the cursor and add it to bgSamples
+      // sample tab: two input form factors for "what to make transparent".
+      //  · Click    → sample the color under the cursor (removes it everywhere)
+      //  · Paintbrush → paint a spatial erase stroke (those pixels go transparent
+      //                 regardless of color — the whole stroke is one undo step)
       if(guidedMode === 'sample'){
-        const c = samplePixel(p.x, p.y);
-        if(c){
-          setSeeds(s => {
-            const existing = s.bgSamples || [];
-            // Tight dedup — only drop *exact* repeat clicks (same pixel value).
-            // The previous 32-step bucket was so permissive that distinct
-            // background tones the user clicked silently disappeared, making
-            // it look like only the first sample worked. Trust the user: if
-            // they clicked a noticeably different color, take it.
-            if(existing.some(e => e.r === c.r && e.g === c.g && e.b === c.b)) return s;
-            return {...s, bgSamples: [...existing, c]};
-          });
+        gestureSnapshotRef.current = {...seeds, drawing:null};
+        if(seeds?.sampleTool === 'paint'){
+          const size = seeds.eraseBrushSize ?? 60;
+          setSeeds(s=>({...s, drawing:{kind:'erase', size, points:[p]}}));
+          dragRef.current = {kind:'guided-erase', moved:true};
+        } else {
+          addSampleAt(p.x, p.y);
+          dragRef.current = {kind:'guided-sample', moved:false};
         }
-        dragRef.current = {kind:'guided-sample', moved:false};
         return;
       }
       // protect: start a new protect stroke
       if(guidedMode === 'protect'){
+        gestureSnapshotRef.current = {...seeds, drawing:null};
         const size = seeds.protectBrushSize ?? 100;
         setSeeds(s=>({...s, drawing:{kind:'protect', size, points:[p]}}));
         dragRef.current = {kind:'guided-protect', moved:true};
@@ -1070,6 +1140,7 @@ function SingleCanvas({image, s, zoom, setZoom, pan, setPan, onClickToggle, peek
       }
       // box drag start — every drag adds another box (additive seeds)
       if(guidedMode === 'box'){
+        gestureSnapshotRef.current = {...seeds, drawing:null};
         setSeeds(s=>({...s, drawing:{kind:'box', startX:p.x, startY:p.y, x:p.x, y:p.y, w:0, h:0}}));
         dragRef.current = {kind:'guided-box', startX:e.clientX, startY:e.clientY, moved:false};
         return;
@@ -1101,6 +1172,11 @@ function SingleCanvas({image, s, zoom, setZoom, pan, setPan, onClickToggle, peek
       setSeeds(st=>({...st, drawing:{...st.drawing, points:[...st.drawing.points, p]}}));
       return;
     }
+    if(dragRef.current?.kind === 'guided-erase'){
+      const p = stageCoords(e); if(!p) return;
+      setSeeds(st=>({...st, drawing:{...st.drawing, points:[...st.drawing.points, p]}}));
+      return;
+    }
     if(dragRef.current && (!dragRef.current.kind || dragRef.current.kind === 'shift-pan')){
       const dx = e.clientX - dragRef.current.sx;
       const dy = e.clientY - dragRef.current.sy;
@@ -1111,10 +1187,12 @@ function SingleCanvas({image, s, zoom, setZoom, pan, setPan, onClickToggle, peek
   const onMouseUp = (e) => {
     if(dragRef.current?.kind === 'guided-box'){
       // commit box if it has area — append to boxes array
+      const d = seeds.drawing;
+      if(d && d.w > 0.02 && d.h > 0.02) pushHistory?.(gestureSnapshotRef.current);
       setSeeds(st=>{
-        const d = st.drawing;
-        if(d && d.w > 0.02 && d.h > 0.02){
-          const newBox = {x:d.x, y:d.y, w:d.w, h:d.h};
+        const dd = st.drawing;
+        if(dd && dd.w > 0.02 && dd.h > 0.02){
+          const newBox = {x:dd.x, y:dd.y, w:dd.w, h:dd.h};
           const existing = (st.boxes && st.boxes.length) ? st.boxes : (st.box ? [st.box] : []);
           return {...st, boxes:[...existing, newBox], box:null, drawing:null};
         }
@@ -1124,6 +1202,7 @@ function SingleCanvas({image, s, zoom, setZoom, pan, setPan, onClickToggle, peek
       return;
     }
     if(dragRef.current?.kind === 'guided-protect'){
+      if(seeds.drawing?.points?.length >= 1) pushHistory?.(gestureSnapshotRef.current);
       setSeeds(st=>{
         const d = st.drawing;
         if(d && d.points && d.points.length >= 1){
@@ -1131,6 +1210,27 @@ function SingleCanvas({image, s, zoom, setZoom, pan, setPan, onClickToggle, peek
         }
         return {...st, drawing:null};
       });
+      dragRef.current = null;
+      return;
+    }
+    if(dragRef.current?.kind === 'guided-erase'){
+      // Commit the erase stroke (paint → transparent). One undo step per stroke.
+      if(seeds.drawing?.points?.length >= 1) pushHistory?.(gestureSnapshotRef.current);
+      setSeeds(st=>{
+        const d = st.drawing;
+        if(d && d.points && d.points.length >= 1){
+          return {...st, eraseStrokes:[...(st.eraseStrokes||[]), {size:d.size, points:d.points}], drawing:null};
+        }
+        return {...st, drawing:null};
+      });
+      dragRef.current = null;
+      return;
+    }
+    if(dragRef.current?.kind === 'guided-sample'){
+      // One undo step per click — only if it actually added a new color.
+      const before = gestureSnapshotRef.current?.bgSamples?.length || 0;
+      const after = seeds.bgSamples?.length || 0;
+      if(after !== before) pushHistory?.(gestureSnapshotRef.current);
       dragRef.current = null;
       return;
     }
@@ -1201,8 +1301,9 @@ function SingleCanvas({image, s, zoom, setZoom, pan, setPan, onClickToggle, peek
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [seeds?.boxes, seeds?.box, seeds?.drawing, seeds?.bgSamples, image?.original]);
 
-  const hasSeeds = effectiveSeedColors.length > 0;
-  // v6 — cutout is driven by Box only.
+  // Cutout shows when there are seed colors OR erase strokes (a spatial-only
+  // erase needs no sampled color).
+  const hasSeeds = effectiveSeedColors.length > 0 || (seeds?.eraseStrokes?.length > 0);
   const showCutout = !s.showOriginal && !peekOriginal && hasSeeds;
   const cutoutUri = typeof image.cutout === 'function' ? image.cutout(s.threshold, s.feather) : image.original;
 
@@ -1219,10 +1320,9 @@ function SingleCanvas({image, s, zoom, setZoom, pan, setPan, onClickToggle, peek
                           [effectiveSeedColors]);
   // Signature for protect strokes — recompute the live cutout when strokes
   // change (or their points/sizes change). Cheap to compute.
-  const protectSig = useMemo(() => {
-    const arr = seeds?.protectStrokes || [];
-    return arr.map(s => `${s.size}:${(s.points||[]).length}:${(s.points||[]).map(p=>`${p.x.toFixed(3)},${p.y.toFixed(3)}`).join(';')}`).join('|');
-  }, [seeds?.protectStrokes]);
+  const strokeSig = (arr) => (arr || []).map(s => `${s.size}:${(s.points||[]).length}:${(s.points||[]).map(p=>`${p.x.toFixed(3)},${p.y.toFixed(3)}`).join(';')}`).join('|');
+  const protectSig = useMemo(() => strokeSig(seeds?.protectStrokes), [seeds?.protectStrokes]);
+  const eraseSig = useMemo(() => strokeSig(seeds?.eraseStrokes), [seeds?.eraseStrokes]);
   useEffect(() => {
     if(!image?.original || !showCutout || !sampleCanvasRef.current) {
       setLiveCutoutUrl(null);
@@ -1254,68 +1354,26 @@ function SingleCanvas({image, s, zoom, setZoom, pan, setPan, onClickToggle, peek
     const range = Math.max(1, hi - lo);
 
     const seedColors = effectiveSeedColors;
-    if(seedColors.length === 0){
+    const eraseStrokes = (seeds?.eraseStrokes || []);
+    if(seedColors.length === 0 && eraseStrokes.length === 0){
       // No-op — we shouldn't even reach here because showCutout requires hasSeeds.
       setLiveCutoutUrl(null);
       return;
     }
 
-    // v13: rasterize protect strokes into a single-channel mask in the same
-    // scaled coordinate space (w × h) as the cutout. Pixels under a protect
-    // stroke skip the seed-color erase entirely and stay fully opaque, with
-    // their ORIGINAL color preserved — this replaces the v12 SVG overlay,
-    // eliminating the aspect-ratio mismatch between the two layers.
-    const protectStrokes = (seeds?.protectStrokes || []);
-    let protectMask = null;
-    if(protectStrokes.length){
-      const pmc = document.createElement('canvas');
-      pmc.width = w; pmc.height = h;
-      const pctx = pmc.getContext('2d');
-      pctx.fillStyle = '#000';
-      pctx.fillRect(0, 0, w, h);
-      pctx.strokeStyle = '#fff';
-      pctx.fillStyle = '#fff';
-      pctx.lineCap = 'round';
-      pctx.lineJoin = 'round';
-      // Stroke radius is stored in stage-frame px (the `base` width). We need
-      // it in working-image px → multiply by w / base. base equals the stage
-      // frame width which corresponds to the source image full width, so the
-      // ratio is just w / sourceImageNaturalWidth = scale (image → working).
-      // We don't have `base` here, so use w / W * (size) — same scale as the
-      // image itself.
-      const radiusScale = w / W;
-      for(const str of protectStrokes){
-        const r = ((str.size || 36) / 2) * radiusScale;
-        const pts = str.points || [];
-        if(pts.length === 0) continue;
-        // dots at every point (covers single-click and round caps)
-        for(const p of pts){
-          pctx.beginPath();
-          pctx.arc(p.x * w, p.y * h, r, 0, Math.PI * 2);
-          pctx.fill();
-        }
-        // polyline segments between points
-        if(pts.length > 1){
-          pctx.lineWidth = r * 2;
-          pctx.beginPath();
-          pctx.moveTo(pts[0].x * w, pts[0].y * h);
-          for(let i = 1; i < pts.length; i++){
-            pctx.lineTo(pts[i].x * w, pts[i].y * h);
-          }
-          pctx.stroke();
-        }
-      }
-      protectMask = pctx.getImageData(0, 0, w, h).data;
-    }
+    // Brush masks in the downscaled (w × h) working space — `size` is in
+    // image-natural px, so radiusScale = w / W. Protect = keep opaque (single
+    // source of truth, no overlay layer); Erase = force transparent regardless
+    // of color (a direct spatial eraser, mirror of the protect brush).
+    const radiusScale = w / W;
+    const protectMask = strokesToMask(seeds?.protectStrokes, w, h, radiusScale);
+    const eraseMask   = strokesToMask(eraseStrokes,          w, h, radiusScale);
+    const hasColor = seedColors.length > 0;
 
-    // Min-distance over ALL seeds. Any seed match → erase, unless protected.
     for(let i = 0; i < data.length; i += 4){
-      // Protected pixels: keep ORIGINAL color and full opacity. This is the
-      // single source of truth for protected regions — no overlay layer.
-      if(protectMask && protectMask[i] > 128){
-        data[i+3] = 255;
-        continue;
-      }
+      if(protectMask && protectMask[i] > 128){ data[i+3] = 255; continue; } // protect → opaque
+      if(eraseMask && eraseMask[i] > 128){ data[i+3] = 0; continue; }       // erase → transparent
+      if(!hasColor){ continue; }  // erase-only image: everything else stays opaque
       const r = data[i], g = data[i+1], b = data[i+2];
       let best = Infinity;
       for(const c of seedColors){
@@ -1340,7 +1398,7 @@ function SingleCanvas({image, s, zoom, setZoom, pan, setPan, onClickToggle, peek
       });
     }, 'image/png');
     return () => { cancelled = true; };
-  }, [image?.id, image?.original, seedSig, seeds?.tolerance, showCutout, protectSig]);
+  }, [image?.id, image?.original, seedSig, seeds?.tolerance, showCutout, protectSig, eraseSig]);
   // Revoke on unmount
   useEffect(() => () => { if(liveCutoutUrl) URL.revokeObjectURL(liveCutoutUrl); }, []);
   const transform = `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`;
@@ -1394,7 +1452,7 @@ function SingleCanvas({image, s, zoom, setZoom, pan, setPan, onClickToggle, peek
          onMouseMove={onMouseMove}
          onMouseUp={onMouseUp}
          onMouseLeave={(e)=>{ onMouseUp(e); setCursorPos(null); }}
-         style={{cursor: brushing ? 'none' : protecting ? 'none' : guiding ? 'crosshair' : cursor}}
+         style={{cursor: brushing ? 'none' : protecting ? 'none' : samplePainting ? 'none' : guiding ? 'crosshair' : cursor}}
          onClick={onCanvasClick}>
 
       <div className="stage">
@@ -1516,6 +1574,26 @@ function SingleCanvas({image, s, zoom, setZoom, pan, setPan, onClickToggle, peek
             borderRadius:'50%',
             border:`1.5px solid oklch(0.62 0.13 145)`,
             background:`color-mix(in oklch, oklch(0.62 0.13 145) 18%, transparent)`,
+            boxShadow:`0 0 0 1px rgba(255,255,255,.9), 0 1px 4px rgba(0,0,0,.18)`,
+          }}/>
+        );
+      })()}
+
+      {/* Sample paintbrush cursor — sized from the brush diameter (image px)
+          mapped to on-screen px, same math as the protect cursor. Reddish to
+          signal "removal". */}
+      {samplePainting && cursorPos && (() => {
+        const W = imgDims?.w || 1;
+        const screenPerImage = (base / W) * zoom;
+        const sz = (seeds.eraseBrushSize ?? 60) * screenPerImage;
+        return (
+          <div style={{
+            position:'absolute', pointerEvents:'none', zIndex:7,
+            left: cursorPos.x, top: cursorPos.y,
+            width: sz, height: sz, transform:'translate(-50%,-50%)',
+            borderRadius:'50%',
+            border:`1.5px solid oklch(0.55 0.18 28)`,
+            background:`color-mix(in oklch, oklch(0.55 0.18 28) 14%, transparent)`,
             boxShadow:`0 0 0 1px rgba(255,255,255,.9), 0 1px 4px rgba(0,0,0,.18)`,
           }}/>
         );
@@ -1753,7 +1831,7 @@ function App(){
 
   // Guided detection state — per-image so seeds persist when toggling images.
   // Default: empty seeds, no mode active.
-  const emptySeeds = {boxes:[], box:null, pins:[], protectStrokes:[], bgSamples:[], tolerance:32, drawing:null};
+  const emptySeeds = {boxes:[], box:null, pins:[], protectStrokes:[], bgSamples:[], eraseStrokes:[], tolerance:32, drawing:null, sampleTool:'click', eraseBrushSize:60};
   // v5 — default to Box. In testing it produced the most reliable cuts because
   // it samples corner pixels (almost always background) regardless of subject.
   const [guidedMode, setGuidedMode] = useState('sample'); // 'sample'|'protect'
@@ -1769,42 +1847,128 @@ function App(){
       return {...prev, [activeId]: next};
     });
   }, [activeId]);
-  const onClearSeeds = () => {
+
+  // ── Undo / Redo / Undo-All history (per image) ────────────────────────────
+  // Every committed edit (sample, paintbrush stroke, restore stroke, box,
+  // chip removal, clear) pushes a snapshot of the *prior* committed seed state
+  // onto a per-image past stack. Undo pops it back; Redo re-applies; Undo All
+  // wipes everything so the image returns to its untouched original.
+  const [historyByImg, setHistoryByImg] = useState({}); // {id:{past:[], future:[]}}
+  const history = (activeId && historyByImg[activeId]) || {past:[], future:[]};
+  const canUndo = history.past.length > 0;
+  const canRedo = history.future.length > 0;
+  // Live ref of committed seeds so commit helpers read the freshest state
+  // without waiting on a re-render.
+  const seedsByImgRef = useRef(seedsByImg);
+  seedsByImgRef.current = seedsByImg;
+
+  // pushHistory — record a pre-action committed snapshot. Called by the canvas
+  // at the end of a drag gesture and by commitSeeds for immediate edits.
+  const pushHistory = useCallback((snapshot) => {
+    if(!activeId || !snapshot) return;
+    setHistoryByImg(prev => {
+      const h = prev[activeId] || {past:[], future:[]};
+      return {...prev, [activeId]: {past:[...h.past, snapshot], future:[]}};
+    });
+  }, [activeId]);
+
+  // commitSeeds — for immediate (non-drag) edits: snapshot the current state,
+  // then apply the change. Drag gestures manage their own snapshot timing.
+  const commitSeeds = useCallback((updater) => {
+    if(!activeId) return;
+    const cur = seedsByImgRef.current[activeId] || emptySeeds;
+    pushHistory({...cur, drawing:null});
+    setSeeds(updater);
+  }, [activeId, pushHistory, setSeeds]);
+
+  // Undo/Redo restore only the *content* of a seed snapshot (what was placed),
+  // keeping the user's current tool/brush prefs. Otherwise stepping back through
+  // a sample would also revert an unrelated Click↔Paintbrush toggle or brush-size
+  // change the user made afterward (those go through plain setSeeds, not history).
+  const restoreSeedContent = (cur, snap) => ({
+    ...cur,                 // keep prefs: sampleTool, eraseBrushSize, protectBrushSize, tolerance
+    boxes: snap.boxes, box: snap.box, pins: snap.pins,
+    bgSamples: snap.bgSamples, protectStrokes: snap.protectStrokes, eraseStrokes: snap.eraseStrokes,
+    drawing: null,
+  });
+
+  const onUndo = useCallback(() => {
+    if(!activeId) return;
+    const h = historyByImg[activeId] || {past:[], future:[]};
+    if(!h.past.length) return;
+    const cur = {...(seedsByImgRef.current[activeId] || emptySeeds), drawing:null};
+    const restored = restoreSeedContent(cur, h.past[h.past.length - 1]);
+    setSeedsByImg(p => ({...p, [activeId]: restored}));
+    setHistoryByImg(p => ({...p, [activeId]: {past:h.past.slice(0, -1), future:[cur, ...h.future]}}));
+  }, [activeId, historyByImg]);
+
+  const onRedo = useCallback(() => {
+    if(!activeId) return;
+    const h = historyByImg[activeId] || {past:[], future:[]};
+    if(!h.future.length) return;
+    const cur = {...(seedsByImgRef.current[activeId] || emptySeeds), drawing:null};
+    const restored = restoreSeedContent(cur, h.future[0]);
+    setSeedsByImg(p => ({...p, [activeId]: restored}));
+    setHistoryByImg(p => ({...p, [activeId]: {past:[...h.past, cur], future:h.future.slice(1)}}));
+  }, [activeId, historyByImg]);
+
+  // Undo All — restore the active image to its original, untouched state.
+  const onUndoAll = useCallback(() => {
     if(!activeId) return;
     setSeedsByImg(prev => { const n = {...prev}; delete n[activeId]; return n; });
-    setGuidedConfByImg(prev => { const n = {...prev}; delete n[activeId]; return n; });
-    showToast('Seeds cleared');
-  };
-  // Discard — revert active image to its original state. Clears the seeds,
-  // any guided confidence, mask refinements, and unmarks "processed".
-  const onDiscardCutout = () => {
-    if(!activeId) return;
-    setSeedsByImg(prev => { const n = {...prev}; delete n[activeId]; return n; });
+    setHistoryByImg(prev => { const n = {...prev}; delete n[activeId]; return n; });
     setGuidedConfByImg(prev => { const n = {...prev}; delete n[activeId]; return n; });
     setMaskEdits(m => { const n = {...m}; delete n[activeId]; return n; });
     setImages(imgs => imgs.map(i => i.id === activeId ? {...i, processed:false, cutoutDataUrl:null, cutoutBlob:null} : i));
     showToast('Reverted to original');
-  };
-  // Keep — commit the current cutout so the right-rail filmstrip thumbnail
-  // reflects it. Distinct from Export, which writes files to disk.
-  const onKeepCutout = async () => {
+  }, [activeId]);
+
+  // Clear — drop all placed seeds for the active image (undoable).
+  const onClearSeeds = () => {
     if(!activeId) return;
+    commitSeeds(s => ({...s, boxes:[], box:null, protectStrokes:[], bgSamples:[], eraseStrokes:[], drawing:null}));
+    showToast('Seeds cleared');
+  };
+
+  // Auto-Keep — "Keep" is no longer a manual button; the cutout is committed to
+  // the filmstrip automatically (debounced) after every edit. When all seeds
+  // are gone (Undo All, or undoing back to empty) the thumbnail snaps back to
+  // the original. This keeps the right-rail in sync without the user having to
+  // remember to press anything.
+  useEffect(() => {
+    if(!activeId) return;
+    // A real cutout needs a removal input — a color sample, a box, or an erase
+    // stroke. Protect strokes alone modify nothing (rasterizeCutout keeps the
+    // image as-is), so they don't count toward "has a cutout".
+    const hasAny = ((seeds.boxes?.length || 0)
+      + (seeds.bgSamples?.length || 0)
+      + (seeds.eraseStrokes?.length || 0)) > 0;
+    if(!hasAny){
+      setImages(imgs => imgs.some(i => i.id === activeId && i.processed)
+        ? imgs.map(i => (i.id === activeId)
+            ? {...i, processed:false, cutoutDataUrl:null, cutoutBlob:null}
+            : i)
+        : imgs);
+      return;
+    }
     const img = images.find(i => i.id === activeId);
     if(!img) return;
-    showToast('Rendering cutout…');
-    try {
-      const {dataUrl, blob, width, height} = await rasterizeCutout(img, seeds, 'png');
-      setImages(imgs => imgs.map(i => i.id === activeId
-        ? {...i, processed:true, cutoutDataUrl: dataUrl, cutoutBlob: blob, cutoutW: width, cutoutH: height}
-        : i));
-      showToast('Cutout saved to filmstrip');
-    } catch(err){
-      console.error(err);
-      // Fallback — at least mark as processed
-      setImages(imgs => imgs.map(i => i.id === activeId ? {...i, processed:true} : i));
-      showToast('Saved (preview only)');
-    }
-  };
+    let cancelled = false;
+    const t = setTimeout(async () => {
+      try {
+        const {dataUrl, blob, width, height} = await rasterizeCutout(img, seeds, 'png');
+        if(cancelled) return;
+        setImages(imgs => imgs.map(i => i.id === activeId
+          ? {...i, processed:true, cutoutDataUrl: dataUrl, cutoutBlob: blob, cutoutW: width, cutoutH: height}
+          : i));
+      } catch(err){
+        if(!cancelled) setImages(imgs => imgs.map(i => i.id === activeId ? {...i, processed:true} : i));
+      }
+    }, 300);
+    return () => { cancelled = true; clearTimeout(t); };
+  // Intentionally keyed on the committed seed fields only (not `drawing` or
+  // `images`) so in-progress strokes don't trigger renders mid-drag.
+  }, [activeId, seeds.bgSamples, seeds.boxes, seeds.eraseStrokes, seeds.protectStrokes, seeds.tolerance]);
   const onResetMask = () => {
     if(!activeId) return;
     setMaskEdits(m => { const n = {...m}; delete n[activeId]; return n; });
@@ -1951,6 +2115,15 @@ function App(){
   useEffect(()=>{
     const onKey = (e) => {
       if(e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+      // Undo / Redo — ⌘Z / ⇧⌘Z (and Ctrl+Y for redo on Windows-style kbds).
+      if((e.metaKey || e.ctrlKey) && (e.key === 'z' || e.key === 'Z')){
+        e.preventDefault();
+        if(e.shiftKey) onRedo(); else onUndo();
+        return;
+      }
+      if((e.metaKey || e.ctrlKey) && (e.key === 'y' || e.key === 'Y')){
+        e.preventDefault(); onRedo(); return;
+      }
       if(e.key === 'g') setView(v => v==='single'?'contact':'single');
       if(e.key === ' '){ e.preventDefault(); setPeekOriginal(true); }
       if(e.key === 'Escape') setSelectedIds(new Set([activeId]));
@@ -1961,6 +2134,16 @@ function App(){
           const cur = prev[activeId] || emptySeeds;
           const next = Math.max(8, Math.min(500, (cur.protectBrushSize ?? 100) + delta * 4));
           return {...prev, [activeId]: {...cur, protectBrushSize: next}};
+        });
+      }
+      // sample-paintbrush size shortcuts
+      if((e.key === '[' || e.key === ']') && guidedMode === 'sample' && activeId){
+        const delta = e.key === '[' ? -1 : 1;
+        setSeedsByImg(prev => {
+          const cur = prev[activeId] || emptySeeds;
+          if((cur.sampleTool ?? 'click') !== 'paint') return prev;
+          const next = Math.max(8, Math.min(400, (cur.eraseBrushSize ?? 60) + delta * 12));
+          return {...prev, [activeId]: {...cur, eraseBrushSize: next}};
         });
       }
       // arrow nav
@@ -1975,7 +2158,7 @@ function App(){
     window.addEventListener('keydown', onKey);
     window.addEventListener('keyup', onUp);
     return ()=>{ window.removeEventListener('keydown', onKey); window.removeEventListener('keyup', onUp); };
-  }, [activeId, images]);
+  }, [activeId, images, guidedMode, onUndo, onRedo]);
 
   // toast helper
   const showToast = (msg) => {
@@ -2155,10 +2338,10 @@ function App(){
           <ControlsPanel
                          activeImage={activeImage}
                          guidedMode={guidedMode} setGuidedMode={setGuidedMode}
-                         seeds={seeds} setSeeds={setSeeds}
+                         seeds={seeds} setSeeds={setSeeds} commitSeeds={commitSeeds}
                          onClearSeeds={onClearSeeds}
-                         onDiscard={onDiscardCutout}
-                         onKeep={onKeepCutout}/>
+                         canUndo={canUndo} canRedo={canRedo}
+                         onUndo={onUndo} onRedo={onRedo} onUndoAll={onUndoAll}/>
         )}
 
         {images.length === 0 ? (
@@ -2191,6 +2374,7 @@ function App(){
             brush={brush} setBrush={setBrush}
             guidedMode={guidedMode}
             seeds={seeds} setSeeds={setSeeds}
+            pushHistory={pushHistory}
             onFit={onFit}
             showOrigClick={showOrigClick}
           />
