@@ -773,7 +773,7 @@ function GuidedPanel({mode, setMode, seeds, setSeeds, commitSeeds, onClearSeeds,
 
       {/* Protect-mode brush size control */}
       {mode === 'protect' && (
-        <div className="field" style={{marginBottom:0}}>
+        <div className="field" style={{marginBottom:0, opacity: hasImage ? 1 : 0.4, pointerEvents: hasImage ? 'auto' : 'none'}}>
           <div className="field-h">
             <span>Brush size</span>
             <span className="mono field-v">{Math.round(seeds.protectBrushSize ?? 100)}px</span>
