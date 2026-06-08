@@ -658,7 +658,7 @@ function GuidedPanel({mode, setMode, seeds, setSeeds, commitSeeds, onClearSeeds,
         const tool = seeds.sampleTool ?? 'click';
         return (
           <div style={{display:'flex',flexDirection:'column',gap:8}}>
-            <div className="seg" role="tablist" aria-label="Sample tool" style={{width:'100%',height:30}}>
+            <div className="seg" role="tablist" aria-label="Sample tool" style={{width:'100%'}}>
               <button role="tab" aria-selected={tool==='click'} className={tool==='click'?'on':''}
                 style={{flex:1,justifyContent:'center'}}
                 onClick={()=>setSeeds(s=>({...s, sampleTool:'click'}))}>
