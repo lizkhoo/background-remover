@@ -439,7 +439,6 @@ function Toolbar({view, setView, onLoad, onExport, onAnalyze, analyzing, process
       <div className="brand">
         <div className="brand-mark"></div>
         <div className="brand-name">Cut-Cut bg rmvr</div>
-        <span className="brand-tag">v0.5 · AI</span>
       </div>
 
       <div className="divider"/>
@@ -812,7 +811,8 @@ function CutoutActions({canUndo, canRedo, hasAny, onUndo, onRedo, onUndoAll}){
       disabled={disabled}
       className="tb-btn ghost"
       style={{
-        flex:1,height:32,justifyContent:'center',
+        flex: danger ? '1.2 1 0' : '1 1 0',
+        height:32,justifyContent:'center',whiteSpace:'nowrap',
         color: danger ? 'var(--danger)' : 'var(--fg-1)',
         opacity: disabled ? 0.4 : 1,
         pointerEvents: disabled ? 'none' : 'auto',
