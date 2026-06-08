@@ -661,11 +661,13 @@ function GuidedPanel({mode, setMode, seeds, setSeeds, commitSeeds, onClearSeeds,
             <div className="seg" role="tablist" aria-label="Sample tool" style={{width:'100%',height:30}}>
               <button role="tab" aria-selected={tool==='click'} className={tool==='click'?'on':''}
                 style={{flex:1,justifyContent:'center'}}
+                disabled={!hasImage}
                 onClick={()=>setSeeds(s=>({...s, sampleTool:'click'}))}>
                 <Icon.Cursor size={13}/> Click
               </button>
               <button role="tab" aria-selected={tool==='paint'} className={tool==='paint'?'on':''}
                 style={{flex:1,justifyContent:'center'}}
+                disabled={!hasImage}
                 onClick={()=>setSeeds(s=>({...s, sampleTool:'paint'}))}>
                 <Icon.Brush size={13}/> Paintbrush
               </button>
@@ -773,7 +775,7 @@ function GuidedPanel({mode, setMode, seeds, setSeeds, commitSeeds, onClearSeeds,
 
       {/* Protect-mode brush size control */}
       {mode === 'protect' && (
-        <div className="field" style={{marginBottom:0, opacity: hasImage ? 1 : 0.4, pointerEvents: hasImage ? 'auto' : 'none'}}>
+        <div className="field" style={{marginBottom:0}}>
           <div className="field-h">
             <span>Brush size</span>
             <span className="mono field-v">{Math.round(seeds.protectBrushSize ?? 100)}px</span>
