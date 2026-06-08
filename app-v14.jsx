@@ -707,7 +707,7 @@ function GuidedPanel({mode, setMode, seeds, setSeeds, commitSeeds, onClearSeeds,
         {counts.boxes === 0 && counts.protectStrokes === 0 && counts.bgSamples === 0 && counts.eraseStrokes === 0 ? (
 
           <div style={{
-            padding:'12px 10px',border:'1px dashed var(--line-2)',borderRadius:6,
+            padding:'12px 10px',borderRadius:6,
             color:'var(--fg-2)',fontSize:11,textAlign:'center',background:'#fff',
           }}>
             {hasImage
