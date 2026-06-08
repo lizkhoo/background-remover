@@ -625,7 +625,7 @@ function GuidedPanel({mode, setMode, seeds, setSeeds, commitSeeds, onClearSeeds,
   const totalSeeds = counts.boxes + counts.protectStrokes + counts.bgSamples + counts.eraseStrokes;
 
   const Tab = ({id, icon, label}) => (
-    <button onClick={()=>setMode(id)}
+    <button onClick={()=>setMode(id)} disabled={!hasImage}
       style={{
         flex:1,height:34,borderRadius:6,cursor:'default',padding:'0 6px',
         border:`1px solid ${mode===id?'var(--primary)':'var(--line)'}`,
@@ -634,6 +634,8 @@ function GuidedPanel({mode, setMode, seeds, setSeeds, commitSeeds, onClearSeeds,
         display:'inline-flex',alignItems:'center',justifyContent:'center',gap:5,
         fontSize:11,fontWeight: mode===id?600:500,
         boxShadow: mode===id ? '0 1px 0 rgba(255,255,255,.12) inset, 0 1px 2px rgba(0,0,0,.18)' : 'none',
+        opacity: !hasImage ? 0.4 : 1,
+        pointerEvents: !hasImage ? 'none' : 'auto',
       }}>
       {icon}<span>{label}</span>
     </button>
@@ -661,17 +663,19 @@ function GuidedPanel({mode, setMode, seeds, setSeeds, commitSeeds, onClearSeeds,
             <div className="seg" role="tablist" aria-label="Sample tool" style={{width:'100%',height:30}}>
               <button role="tab" aria-selected={tool==='click'} className={tool==='click'?'on':''}
                 style={{flex:1,justifyContent:'center'}}
+                disabled={!hasImage}
                 onClick={()=>setSeeds(s=>({...s, sampleTool:'click'}))}>
                 <Icon.Cursor size={13}/> Click
               </button>
               <button role="tab" aria-selected={tool==='paint'} className={tool==='paint'?'on':''}
                 style={{flex:1,justifyContent:'center'}}
+                disabled={!hasImage}
                 onClick={()=>setSeeds(s=>({...s, sampleTool:'paint'}))}>
                 <Icon.Brush size={13}/> Paintbrush
               </button>
             </div>
             {tool === 'paint' && (
-              <div className="field" style={{marginBottom:0}}>
+              <div className="field" style={{marginBottom:0, opacity: hasImage ? 1 : 0.4, pointerEvents: hasImage ? 'auto' : 'none'}}>
                 <div className="field-h">
                   <span>Brush size</span>
                   <span className="mono field-v">{Math.round(seeds.eraseBrushSize ?? 60)}px</span>
@@ -773,7 +777,7 @@ function GuidedPanel({mode, setMode, seeds, setSeeds, commitSeeds, onClearSeeds,
 
       {/* Protect-mode brush size control */}
       {mode === 'protect' && (
-        <div className="field" style={{marginBottom:0}}>
+        <div className="field" style={{marginBottom:0, opacity: hasImage ? 1 : 0.4, pointerEvents: hasImage ? 'auto' : 'none'}}>
           <div className="field-h">
             <span>Brush size</span>
             <span className="mono field-v">{Math.round(seeds.protectBrushSize ?? 100)}px</span>
