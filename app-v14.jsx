@@ -439,7 +439,6 @@ function Toolbar({view, setView, onLoad, onExport, onAnalyze, analyzing, process
       <div className="brand">
         <div className="brand-mark"></div>
         <div className="brand-name">Cut-Cut bg rmvr</div>
-        <span className="brand-tag">v0.5 · AI</span>
       </div>
 
       <div className="divider"/>
