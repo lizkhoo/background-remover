@@ -811,7 +811,8 @@ function CutoutActions({canUndo, canRedo, hasAny, onUndo, onRedo, onUndoAll}){
       disabled={disabled}
       className="tb-btn ghost"
       style={{
-        flex:1,height:32,justifyContent:'center',
+        flex: danger ? '1.2 1 0' : '1 1 0',
+        height:32,justifyContent:'center',whiteSpace:'nowrap',
         color: danger ? 'var(--danger)' : 'var(--fg-1)',
         opacity: disabled ? 0.4 : 1,
         pointerEvents: disabled ? 'none' : 'auto',
