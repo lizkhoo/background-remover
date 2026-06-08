@@ -646,7 +646,7 @@ function GuidedPanel({mode, setMode, seeds, setSeeds, commitSeeds, onClearSeeds,
       </div>
 
       <div style={{display:'flex',gap:5}}>
-        <Tab id="sample"  icon={<Icon.Pipette size={12}/>} label="Sample"/>
+        <Tab id="sample"  icon={<Icon.Pipette size={12}/>} label="Remove"/>
         <Tab id="protect" icon={<Icon.Shield size={12}/>} label="Restore"/>
       </div>
 
